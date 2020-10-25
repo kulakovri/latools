@@ -4,7 +4,6 @@ Main functions for interacting with LAtools.
 (c) Oscar Branson : https://github.com/oscarbranson
 """
 
-import configparser
 import itertools
 import inspect
 import json
@@ -16,36 +15,30 @@ import dateutil
 import textwrap
 
 import matplotlib.pyplot as plt
-import matplotlib as mpl
-import numpy as np
 import pandas as pd
 import pkg_resources as pkgrs
 
 import uncertainties as unc
-import uncertainties.unumpy as un
-
-from sklearn.preprocessing import minmax_scale, scale
-from sklearn.cluster import KMeans
-from scipy.optimize import curve_fit
 
 from .helpers import plot
 from .filtering import filters
 from .filtering.classifier_obj import classifier
 
-from .D_obj import D
-from .helpers.helpers import (rolling_window, enumerate_bool,
-                      un_interp1d, get_date,
-                      unitpicker, rangecalc, Bunch, calc_grads,
-                      get_total_time_span)
+from .helpers.helpers import enumerate_bool, unitpicker, Bunch, calc_grads
 from .helpers import logging
 from .helpers.logging import _log
-from .helpers.config import read_configuration, config_locator
+from .helpers.config import config_locator
 from .helpers.stat_fns import *
 from .helpers import utils
-from .helpers import srm as srms
-from .helpers.progressbars import progressbar
-from .helpers.chemistry import analyte_mass, decompose_molecule
-from .helpers.analyte_names import get_analyte_name, analyte_2_massname, pretty_element, analyte_sort_fn
+from .helpers.chemistry import analyte_mass
+from .helpers.analyte_names import pretty_element, analyte_sort_fn
+
+from .stages.RawLoader import RawLoader
+from .stages.Despiker import Despiker
+from .stages.AutoRanger import AutoRanger
+from .stages.BackgroundCalculator import BackgroundCalculator, BackgroundSubtractor
+from .stages.RatioCalculator import RatioCalculator
+from .stages.Calibrator import Calibrator
 
 idx = pd.IndexSlice  # multi-index slicing!
 
@@ -53,6 +46,7 @@ idx = pd.IndexSlice  # multi-index slicing!
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 # deactivate numpy invalid comparison warnings
 np.seterr(invalid='ignore')
+
 
 
 # TODO: Allow full sklearn integration by allowing sample-wise application of custom classifiers. i.e. Provide data collection (get_data) ajd filter addition API.
@@ -136,215 +130,14 @@ class analyse(object):
                  dataformat=None, extension='.csv', srm_identifier='STD',
                  cmap=None, time_format=None, internal_standard='Ca43',
                  names='file_names', srm_file=None, pbar=None):
-        """
-        For processing and analysing whole LA - ICPMS datasets.
-        """
-        # initialise log
-        params = {k: v for k, v in locals().items() if k not in ['self', 'pbar']}
-        self.log = ['__init__ :: args=() kwargs={}'.format(str(params))]
+        self.raw = RawLoader(data_folder, errorhunt=errorhunt, config=config,
+                 dataformat=dataformat, extension=extension, srm_identifier=srm_identifier,
+                 cmap=cmap, time_format=time_format, internal_standard=internal_standard,
+                 names=names, srm_file=srm_file, pbar=pbar)
 
-        # assign file paths
-        self.folder = os.path.realpath(data_folder)
-        self.parent_folder = os.path.dirname(self.folder)
-        self.files = np.array([f for f in os.listdir(self.folder)
-                               if extension in f])
 
-        # set line length for outputs
-        self._line_width = 80
-
-        # make output directories
-        self.report_dir = re.sub('//', '/',
-                                 os.path.join(self.parent_folder,
-                                              os.path.basename(self.folder) + '_reports/'))
-        if not os.path.isdir(self.report_dir):
-            os.mkdir(self.report_dir)
-        self.export_dir = re.sub('//', '/',
-                                 os.path.join(self.parent_folder,
-                                              os.path.basename(self.folder) + '_export/'))
-        if not os.path.isdir(self.export_dir):
-            os.mkdir(self.export_dir)
-
-        # load configuration parameters
-        self.config = read_configuration(config)
-
-        # print some info about the analysis and setup.
-        startmsg = self._fill_line('-') + 'Starting analysis:'
-        if srm_file is None or dataformat is None:
-            startmsg += '\n  Using {} configuration'.format(self.config['config'])
-            if config == 'DEFAULT':
-                startmsg += ' (default).'
-            else:
-                startmsg += '.'
-            pretext = '  with'
-        else:
-            pretext = 'Using'
-        
-        if srm_file is not None:
-            startmsg += '\n  ' + pretext + ' custom srm_file ({})'.format(srm_file)
-        if isinstance(dataformat, str):
-            startmsg += '\n  ' + pretext + ' custom dataformat file ({})'.format(dataformat)
-        elif isinstance(dataformat, dict):
-            startmsg += '\n  ' + pretext + ' custom dataformat dict'
-        print(startmsg)
-
-        self._load_srmfile(srm_file)
-
-        self._load_dataformat(dataformat)
-
-        # link up progress bars
-        if pbar is None:
-            self.pbar = progressbar()
-        else:
-            self.pbar = pbar
-
-        # load data into list (initialise D objects)
-        with self.pbar.set(total=len(self.files), desc='Loading Data') as prog:
-            data = [None] * len(self.files)
-            for i, f in enumerate(self.files):
-                data[i] = (D(os.path.join(self.folder, f),
-                           dataformat=self.dataformat,
-                           errorhunt=errorhunt,
-                           cmap=cmap,
-                           internal_standard=internal_standard,
-                           name=names))
-                prog.update()
-
-        # create universal time scale
-        if 'date' in data[0].meta.keys():
-            if (time_format is None) and ('time_format' in self.dataformat.keys()):
-                time_format = self.dataformat['time_format']
-
-            start_times = []
-            for d in data:
-                start_times.append(get_date(d.meta['date'], time_format))
-            min_time = min(start_times)
-
-            for d, st in zip(data, start_times):
-                d.uTime = d.Time + (st - min_time).seconds
-        else:
-            ts = 0
-            for d in data:
-                d.uTime = d.Time + ts
-                ts += d.Time[-1]
-            msg = self._wrap_text( 
-                          "Time not determined from dataformat. Universal time scale " +
-                          "approximated as continuously measured samples. " +
-                          "Samples might not be in the right order. "
-                          "Background correction and calibration may not behave " +
-                          "as expected.")
-            warnings.warn(self._wrap_msg(msg, '*'))
-
-        self.max_time = max([d.uTime.max() for d in data])
-
-        # sort data by uTime
-        data.sort(key=lambda d: d.uTime[0])
-
-        # process sample names
-        if (names == 'file_names') | (names == 'metadata_names'):
-            samples = np.array([s.sample for s in data], dtype=object)  # get all sample names
-            # if duplicates, rename them
-            usamples, ucounts = np.unique(samples, return_counts=True)
-            if usamples.size != samples.size:
-                dups = usamples[ucounts > 1]  # identify duplicates
-                nreps = ucounts[ucounts > 1]  # identify how many times they repeat
-                for d, n in zip(dups, nreps):  # cycle through duplicates
-                    new = [d + '_{}'.format(i) for i in range(n)]  # append number to duplicate names
-                    ind = samples == d
-                    samples[ind] = new  # rename in samples
-                    for s, ns in zip([data[i] for i in np.where(ind)[0]], new):
-                        s.sample = ns  # rename in D objects
-        else:
-            samples = np.arange(len(data))  # assign a range of numbers
-            for i, s in enumerate(samples):
-                data[i].sample = s
-        self.samples = samples
-
-        # copy colour map to top level
-        self.cmaps = data[0].cmap
-
-        # get analytes
-        # TODO: does this preserve the *order* of the analytes?
-        all_analytes = set()
-        extras = set()
-        for d in data:
-            all_analytes.update(d.analytes)
-            extras.update(all_analytes.symmetric_difference(d.analytes))
-        self.analytes = all_analytes.difference(extras)
-        mismatch = []
-        if self.analytes != all_analytes:
-            smax = 0
-            for d in data:
-                if d.analytes != self.analytes:
-                    mismatch.append((d.sample, d.analytes.difference(self.analytes)))
-                    if len(d.sample) > smax:
-                        smax = len(d.sample)
-            msg = (self._fill_line('*') +
-                   'All data files do not contain the same analytes.\n' + 
-                   'Only analytes present in all files will be processed.\n' + 
-                   'In the following files, these analytes will be excluded:\n')
-            for s, a in mismatch:
-                msg += ('  {0: <' + '{:}'.format(smax + 2) + '}:  ').format(s) + str(a) + '\n'
-            msg += self._fill_line('*')
-            warnings.warn(msg)
-
-        if len(self.analytes) == 0:
-            raise ValueError('No analyte names identified. Please check the \ncolumn_id > pattern ReGeX in your dataformat file.')
-
-        if internal_standard in self.analytes:
-            self.internal_standard = internal_standard
-        else:
-            raise ValueError('The internal standard ({}) is not amongst the '.format(internal_standard) +
-                             'analytes in\nyour data files. Please make sure it is specified correctly.')
-        self.minimal_analytes = set([internal_standard])
-
-        # keep record of which stages of processing have been performed
-        self.stages_complete = set(['rawdata'])
-
-        # From this point on, data stored in dicts
-        self.data = Bunch(zip(self.samples, data))
-        
-        # remove mismatch analytes - QUICK-FIX - SHOULD BE DONE HIGHER UP?
-        for s, a in mismatch:
-            self.data[s].analytes = self.data[s].analytes.difference(a)
-            
-        # get SRM info
-        self.srm_identifier = srm_identifier
-        self.stds = []  # make this a dict
-        _ = [self.stds.append(s) for s in self.data.values()
-             if self.srm_identifier in s.sample]
-        self.srms_ided = False
-
-        # set up focus_stage recording
-        self.focus_stage = 'rawdata'
-        self.focus = Bunch()
-
-        # set up subsets
-        self._has_subsets = False
-        self._subset_names = []
-        self.subsets = Bunch()
-        self.subsets['All_Analyses'] = self.samples
-        self.subsets[self.srm_identifier] = [s for s in self.samples if self.srm_identifier in s]
-        self.subsets['All_Samples'] = [s for s in self.samples if self.srm_identifier not in s]
-        self.subsets['not_in_set'] = self.subsets['All_Samples'].copy()
-
-        # remove any analytes for which all counts are zero
-        # self.get_focus()
-        # for a in self.analytes:
-        #     if np.nanmean(self.focus[a] == 0):
-        #         self.analytes.remove(a)
-        #         warnings.warn('{} contains no data - removed from analytes')
-        
-        # initialise classifiers
-        self.classifiers = Bunch()
-
-        # report
-        print(('Loading Data:\n  {:d} Data Files Loaded: {:d} standards, {:d} '
-               'samples').format(len(self.data),
-                                 len(self.stds),
-                                 len(self.data) - len(self.stds)))
-        astr = self._wrap_text('Analytes: ' + ' '.join(self.analytes_sorted()))
-        print(astr)
-        print('  Internal Standard: {}'.format(self.internal_standard))
+    def move_attributes_from_previous_stage(self, rawloader):
+        self.__dict__ = rawloader.__dict__
 
     def _fill_line(self, char, newline=True):
         """Generate a full line of given character"""
@@ -355,10 +148,10 @@ class analyse(object):
 
     def _wrap_text(self, text):
         """Splits text over multiple lines to fit within self._line_width"""
-        return '\n'.join(textwrap.wrap(text, width=self._line_width, 
+        return '\n'.join(textwrap.wrap(text, width=self._line_width,
                                        break_long_words=False))
 
-    
+
     def _wrap_msg(self, msg, char):
         return self._fill_line(char) + msg + '\n' + self._fill_line(char, False)
 
@@ -403,7 +196,7 @@ class analyse(object):
         # if it's a dict, just assign it straight away.
         elif isinstance(dataformat, dict):
             self.dataformat = dataformat
-    
+
     def _load_srmfile(self, srm_file):
         """
         Check srmfile exists, and store it in a class attribute.
@@ -454,7 +247,7 @@ class analyse(object):
                                 "exist.\nUse 'make_subset' to create a" +
                                 "subset."))
         return samples
-    
+
     def _log_header(self):
         return ['# LATOOLS analysis log saved at {}'.format(time.strftime('%Y:%m:%d %H:%M:%S')),
                 'data_folder :: {}'.format(self.folder),
@@ -481,7 +274,7 @@ class analyse(object):
                          calib_srms_used=['NIST610', 'NIST612', 'NIST614'],
                          calib_zero_intercept=True, calib_n_min=10,
                          plots=True):
-        
+
         self.despike(noise_despiker=noise_despiker,
                      win=despike_win, nlim=despike_nlim,
                      maxiter=despike_maxiter)
@@ -583,155 +376,9 @@ class analyse(object):
             (min, max) pairs identifying the boundaries of contiguous
             True regions in the boolean arrays.
         """
-        if focus_stage == 'despiked':
-            if 'despiked' not in self.stages_complete:
-                focus_stage = 'rawdata'
-
-        if analyte is None:
-            analyte = self.internal_standard
-        elif analyte in self.analytes:
-            self.minimal_analytes.update([analyte])
-
-        fails = {}  # list for catching failures.
-        with self.pbar.set(total=len(self.data), desc='AutoRange') as prog:
-            for s, d in self.data.items():
-                f = d.autorange(analyte=analyte, gwin=gwin, swin=swin, win=win,
-                                on_mult=on_mult, off_mult=off_mult,
-                                ploterrs=ploterrs, transform=transform)
-                if f is not None:
-                    fails[s] = f
-                prog.update()  # advance progress bar
-        # handle failures
-        if len(fails) > 0:
-            wstr = ('\n\n' + '*' * 41 + '\n' +
-                    '                 WARNING\n' + '*' * 41 + '\n' +
-                    'Autorange failed for some samples:\n')
-
-            kwidth = max([len(k) for k in fails.keys()]) + 1
-            fstr = '  {:' + '{}'.format(kwidth) + 's}: '
-            for k in sorted(fails.keys()):
-                wstr += fstr.format(k) + ', '.join(['{:.1f}'.format(f) for f in fails[k][-1]]) + '\n'
-
-            wstr += ('\n*** THIS IS NOT NECESSARILY A PROBLEM ***\n' +
-                     'But please check the plots below to make\n' +
-                     'sure they look OK. Failures are marked by\n' +
-                     'dashed vertical red lines.\n\n' +
-                     'To examine an autorange failure in more\n' +
-                     'detail, use the `autorange_plot` method\n' +
-                     'of the failing data object, e.g.:\n' +
-                     "dat.data['Sample'].autorange_plot(params)\n" +
-                     '*' * 41 + '\n')
-            warnings.warn(wstr)
-        
-        self.stages_complete.update(['autorange'])
-        return
-
-    def find_expcoef(self, nsd_below=0., plot=False,
-                     trimlim=None, autorange_kwargs={}):
-        """
-        Determines exponential decay coefficient for despike filter.
-
-        Fits an exponential decay function to the washout phase of standards
-        to determine the washout time of your laser cell. The exponential
-        coefficient reported is `nsd_below` standard deviations below the
-        fitted exponent, to ensure that no real data is removed.
-
-        Total counts are used in fitting, rather than a specific analyte.
-
-        Parameters
-        ----------
-        nsd_below : float
-            The number of standard deviations to subtract from the fitted
-            coefficient when calculating the filter exponent.
-        plot : bool or str
-            If True, creates a plot of the fit, if str the plot is to the
-            location specified in str.
-        trimlim : float
-            A threshold limit used in determining the start of the
-            exponential decay region of the washout. Defaults to half
-            the increase in signal over background. If the data in
-            the plot don't fall on an exponential decay line, change
-            this number. Normally you'll need to increase it.
-
-        Returns
-        -------
-        None
-        """
-        print('Calculating exponential decay coefficient\nfrom SRM washouts...')
-
-        def findtrim(tr, lim=None):
-            trr = np.roll(tr, -1)
-            trr[-1] = 0
-            if lim is None:
-                lim = 0.5 * np.nanmax(tr - trr)
-            ind = (tr - trr) >= lim
-            return np.arange(len(ind))[ind ^ np.roll(ind, -1)][0]
-
-        if not hasattr(self.stds[0], 'trnrng'):
-            for s in self.stds:
-                s.autorange(**autorange_kwargs, ploterrs=False)
-
-        trans = []
-        times = []
-        for v in self.stds:
-            for trnrng in v.trnrng[-1::-2]:
-                tr = minmax_scale(v.data['total_counts'][(v.Time > trnrng[0]) & (v.Time < trnrng[1])])
-                sm = np.apply_along_axis(np.nanmean, 1,
-                                         rolling_window(tr, 3, pad=0))
-                sm[0] = sm[1]
-                trim = findtrim(sm, trimlim) + 2
-                trans.append(minmax_scale(tr[trim:]))
-                times.append(np.arange(tr[trim:].size) *
-                             np.diff(v.Time[1:3]))
-
-        times = np.concatenate(times)
-        times = np.round(times, 2)
-        trans = np.concatenate(trans)
-
-        ti = []
-        tr = []
-        for t in np.unique(times):
-            ti.append(t)
-            tr.append(np.nanmin(trans[times == t]))
-
-        def expfit(x, e):
-            """
-            Exponential decay function.
-            """
-            return np.exp(e * x)
-
-        ep, ecov = curve_fit(expfit, ti, tr, p0=(-1.))
-
-        eeR2 = R2calc(trans, expfit(times, ep))
-
-        if plot:
-            fig, ax = plt.subplots(1, 1, figsize=[6, 4])
-
-            ax.scatter(times, trans, alpha=0.2, color='k', marker='x', zorder=-2)
-            ax.scatter(ti, tr, alpha=1, color='k', marker='o')
-            fitx = np.linspace(0, max(ti))
-            ax.plot(fitx, expfit(fitx, ep), color='r', label='Fit')
-            ax.plot(fitx, expfit(fitx, ep - nsd_below * np.diag(ecov)**.5, ),
-                    color='b', label='Used')
-            ax.text(0.95, 0.75,
-                    ('y = $e^{%.2f \pm %.2f * x}$\n$R^2$= %.2f \nCoefficient: '
-                     '%.2f') % (ep,
-                                np.diag(ecov)**.5,
-                                eeR2,
-                                ep - nsd_below * np.diag(ecov)**.5),
-                    transform=ax.transAxes, ha='right', va='top', size=12)
-            ax.set_xlim(0, ax.get_xlim()[-1])
-            ax.set_xlabel('Time (s)')
-            ax.set_ylim(-0.05, 1.05)
-            ax.set_ylabel('Proportion of Signal')
-            plt.legend()
-            if isinstance(plot, str):
-                fig.savefig(plot)
-
-        self.expdecay_coef = ep - nsd_below * np.diag(ecov)**.5
-
-        print('  {:0.2f}'.format(self.expdecay_coef[0]))
-
+        self.autoranged = AutoRanger(self.despiked, analyte=analyte, gwin=gwin, swin=swin, win=win,
+                  on_mult=on_mult, off_mult=off_mult,
+                  transform=transform, ploterrs=ploterrs, focus_stage=focus_stage)
         return
 
     @_log
@@ -781,24 +428,9 @@ class analyse(object):
         -------
         None
         """
-        if focus_stage != self.focus_stage:
-            self.set_focus(focus_stage)
-
-        if expdecay_despiker and exponent is None:
-            if not hasattr(self, 'expdecay_coef'):
-                self.find_expcoef(plot=exponentplot,
-                                  autorange_kwargs=autorange_kwargs)
-            exponent = self.expdecay_coef
-            time.sleep(0.1)
-
-        with self.pbar.set(total=len(self.data), desc='Despiking') as prog:
-            for d in self.data.values():
-                d.despike(expdecay_despiker, exponent,
-                        noise_despiker, win, nlim, maxiter)
-                prog.update()
-
-        self.stages_complete.update(['despiked'])
-        self.focus_stage = 'despiked'
+        self.despiked = Despiker(self.raw, expdecay_despiker=expdecay_despiker, exponent=exponent,
+                noise_despiker=noise_despiker, win=win, nlim=nlim., exponentplot=exponentplot,
+                maxiter=maxiter, autorange_kwargs=autorange_kwargs, focus_stage=focus_stage)
         return
 
     # functions for background correction
@@ -844,7 +476,7 @@ class analyse(object):
         """
         allbkgs = {'uTime': [],
                    'ns': []}
-                
+
         if focus_stage == 'despiked':
             if 'despiked' not in self.stages_complete:
                 focus_stage = 'rawdata'
@@ -938,135 +570,9 @@ class analyse(object):
             * 'ratios': element ratio data, created by self.ratio.
             * 'calibrated': ratio data calibrated to standards, created by self.calibrate.
         """
-        if analytes is None:
-            analytes = self.analytes
-            self.bkg = Bunch()
-        elif isinstance(analytes, str):
-            analytes = [analytes]
-        
-        if weight_fwhm is None:
-            weight_fwhm = 600  # 10 minute default window
-
-        self.get_background(n_min=n_min, n_max=n_max,
-                            bkg_filter=bkg_filter,
-                            f_win=f_win, f_n_lim=f_n_lim, focus_stage=focus_stage)
-
-        # Gaussian - weighted average
-        if 'calc' not in self.bkg.keys():
-            # create time points to calculate background
-            if cstep is None:
-                cstep = weight_fwhm / 20
-            elif cstep > weight_fwhm:
-                warnings.warn("\ncstep should be less than weight_fwhm. Your backgrounds\n" +
-                              "might not behave as expected.\n")
-            bkg_t = np.linspace(0,
-                                self.max_time,
-                                int(self.max_time // cstep))
-            self.bkg['calc'] = Bunch()
-            self.bkg['calc']['uTime'] = bkg_t
-
-        # TODO : calculation then dict assignment is clumsy...
-        mean, std, stderr = gauss_weighted_stats(self.bkg['raw'].uTime,
-                                                 self.bkg['raw'].loc[:, analytes].values,
-                                                 self.bkg['calc']['uTime'],
-                                                 fwhm=weight_fwhm)
-        self.bkg_interps = {}
-
-        for i, a in enumerate(analytes):
-            self.bkg['calc'][a] = {'mean': mean[i],
-                                    'std': std[i],
-                                    'stderr': stderr[i]}
-            self.bkg_interps[a] = un_interp1d(x=self.bkg['calc']['uTime'],
-                                              y=un.uarray(self.bkg['calc'][a]['mean'],
-                                                          self.bkg['calc'][a][errtype]))
-
-    @_log
-    def bkg_calc_interp1d(self, analytes=None, kind=1, n_min=10, n_max=None, cstep=30,
-                          bkg_filter=False, f_win=7, f_n_lim=3, errtype='stderr', focus_stage='despiked'):
-        """
-        Background calculation using a 1D interpolation.
-
-        scipy.interpolate.interp1D is used for interpolation.
-
-        Parameters
-        ----------
-        analytes : str or iterable
-            Which analyte or analytes to calculate.
-        kind : str or int
-            Integer specifying the order of the spline interpolation
-            used, or string specifying a type of interpolation.
-            Passed to `scipy.interpolate.interp1D`.
-        n_min : int
-            Background regions with fewer than n_min points
-            will not be included in the fit.
-        cstep : float or None
-            The interval between calculated background points.
-        filter : bool
-            If true, apply a rolling filter to the isolated background regions
-            to exclude regions with anomalously high values. If True, two parameters
-            alter the filter's behaviour:
-        f_win : int
-            The size of the rolling window
-        f_n_lim : float
-            The number of standard deviations above the rolling mean
-            to set the threshold.
-        focus_stage : str
-            Which stage of analysis to apply processing to. 
-            Defaults to 'despiked' if present, or 'rawdata' if not. 
-            Can be one of:
-            * 'rawdata': raw data, loaded from csv file.
-            * 'despiked': despiked data.
-            * 'signal'/'background': isolated signal and background data.
-              Created by self.separate, after signal and background
-              regions have been identified by self.autorange.
-            * 'bkgsub': background subtracted data, created by 
-              self.bkg_correct
-            * 'ratios': element ratio data, created by self.ratio.
-            * 'calibrated': ratio data calibrated to standards, created by self.calibrate.            
-        """
-        if analytes is None:
-            analytes = self.analytes
-            self.bkg = Bunch()
-        elif isinstance(analytes, str):
-            analytes = [analytes]
-
-        self.get_background(n_min=n_min, n_max=n_max,
-                            bkg_filter=bkg_filter,
-                            f_win=f_win, f_n_lim=f_n_lim, focus_stage=focus_stage)
-
-        def pad(a, lo=None, hi=None):
-            if lo is None:
-                lo = [a[0]]
-            if hi is None:
-                hi = [a[-1]]
-            return np.concatenate((lo, a, hi))
-
-        if 'calc' not in self.bkg.keys():
-            # create time points to calculate background
-            
-            bkg_t = pad(np.ravel(self.bkg.raw.loc[:, ['uTime', 'ns']].groupby('ns').aggregate([min, max])))
-            bkg_t = np.unique(np.sort(np.concatenate([bkg_t, np.arange(0, self.max_time, cstep)])))
-
-            self.bkg['calc'] = Bunch()
-            self.bkg['calc']['uTime'] = bkg_t
-
-        d = self.bkg['summary']
-        self.bkg_interps = {}
-        with self.pbar.set(total=len(analytes), desc='Calculating Analyte Backgrounds') as prog:
-            for a in analytes:
-                fill_vals = (un.uarray(d.loc[:, (a, 'mean')].iloc[0], d.loc[:, (a, errtype)].iloc[0]),
-                             un.uarray(d.loc[:, (a, 'mean')].iloc[-1], d.loc[:, (a, errtype)].iloc[-1]))
-                p = un_interp1d(x=d.loc[:, ('uTime', 'mean')],
-                                y=un.uarray(d.loc[:, (a, 'mean')],
-                                            d.loc[:, (a, errtype)]),
-                                kind=kind, bounds_error=False, fill_value=fill_vals)
-                self.bkg_interps[a] = p
-                self.bkg['calc'][a] = {'mean': p.new_nom(self.bkg['calc']['uTime']),
-                                       errtype: p.new_std(self.bkg['calc']['uTime'])}
-                prog.update()
-
-        # self.bkg['calc']
-
+        self.background_calculated = BackgroundCalculator(self.autoranged, analytes=analytes, weight_fwhm=weight_fwhm,
+                              n_min=n_min, n_max=n_max, cstep=cstep, errtype=errtype,
+                              bkg_filter=bkg_filter, f_win=f_win, f_n_lim=f_n_lim, focus_stage=focus_stage)
         return
 
     @_log
@@ -1096,35 +602,10 @@ class analyse(object):
             * 'ratios': element ratio data, created by self.ratio.
             * 'calibrated': ratio data calibrated to standards, created by self.calibrate.
         """
-        if analytes is None:
-            analytes = self.analytes
-        elif isinstance(analytes, str):
-            analytes = [analytes]
-
-        if focus_stage == 'despiked':
-            if 'despiked' not in self.stages_complete:
-                focus_stage = 'rawdata'
-
-        # make uncertainty-aware background interpolators
-        # bkg_interps = {}
-        # for a in analytes:
-        #     bkg_interps[a] = un_interp1d(x=self.bkg['calc']['uTime'],
-        #                                  y=un.uarray(self.bkg['calc'][a]['mean'],
-        #                                              self.bkg['calc'][a][errtype]))
-        # self.bkg_interps = bkg_interps
-
-        # apply background corrections
-        with self.pbar.set(total=len(self.data), desc='Background Subtraction') as prog:
-            for d in self.data.values():
-                # [d.bkg_subtract(a, bkg_interps[a].new(d.uTime), None, focus_stage=focus_stage) for a in analytes]
-                [d.bkg_subtract(a, self.bkg_interps[a].new(d.uTime), ~d.sig, focus_stage=focus_stage) for a in analytes]
-                d.setfocus('bkgsub')
-
-                prog.update()
-
-        self.stages_complete.update(['bkgsub'])
-        self.focus_stage = 'bkgsub'
+        self.background_subtracted = BackgroundSubtractor(
+            self.background_calculated, analytes=analytes, errtype=errtype, focus_stage=focus_stage)
         return
+
 
     @_log
     def correct_spectral_interference(self, target_analyte, source_analyte, f):
@@ -1225,14 +706,14 @@ class analyse(object):
         fig = plt.figure(figsize=figsize)
 
         ax = fig.add_axes([.07, .1, .84, .8])
-        
+
         with self.pbar.set(total=len(analytes), desc='Plotting backgrounds') as prog:
             for a in analytes:
                 # draw data points
                 ax.scatter(self.bkg['raw'].uTime, self.bkg['raw'].loc[:, a],
                         alpha=0.5, s=3, c=self.cmaps[a],
                         lw=0.5)
-                
+
                 # draw STD boxes
                 for i, r in self.bkg['summary'].iterrows():
                     x = (r.loc['uTime', 'mean'] - r.loc['uTime', 'std'] * 2,
@@ -1311,369 +792,9 @@ class analyse(object):
         -------
         None
         """
-        if 'bkgsub' not in self.stages_complete:
-            raise RuntimeError('Cannot calculate ratios before background subtraction.')
-        
-        if analytes is None:
-            analytes = self.analytes
-        elif isinstance(analytes, str):
-            analytes = [analytes]
+        self.ratio_calculated = RatioCalculator(
+            self.background_subtracted, internal_standard=internal_standard, analytes=analytes)
 
-        if internal_standard is not None:
-            self.internal_standard = internal_standard
-            self.minimal_analytes.update([internal_standard])
-
-        with self.pbar.set(total=len(self.data), desc='Ratio Calculation') as prog:
-            for s in self.data.values():
-                s.ratio(internal_standard=self.internal_standard, analytes=analytes)
-                prog.update()
-
-        self.stages_complete.update(['ratios'])
-        self.focus_stage = 'ratios'
-        return
-
-    def srm_load_database(self, srms_used=None, reload=False):
-        if not hasattr(self, 'srmdat') or reload:
-            # load SRM info
-            srmdat = srms.read_table(self.srmfile)
-            srmdat = srmdat.loc[srms_used]
-            srmdat.reset_index(inplace=True)
-            srmdat.set_index(['SRM', 'Item'], inplace=True)
-            # empty columns for mol_ratio and mol_ratio_err
-            srmdat.loc[:, 'mol_ratio'] = np.nan
-            srmdat.loc[:, 'mol_ratio_err'] = np.nan
-
-            # get element name
-            internal_el = get_analyte_name(self.internal_standard)
-            # calculate ratios to internal_standard for all elements
-
-            analyte_srm_link = {}
-            warns = []
-            srmsubs = []
-
-            for srm in srms_used:
-                srmsub = srmdat.loc[srm]
-
-                # determine analyte - Item pairs in table
-                ad = {}
-                for a in self.analytes:
-                    # check ig there's an exact match of form [Mass][Element] in srmdat
-                    mna = analyte_2_massname(a)
-                    if mna in srmsub.index:
-                        ad[a] = mna
-                    else:
-                        # if not, match by element name.
-                        item = srmsub.index[srmsub.index.str.contains(get_analyte_name(a))].values
-                        if len(item) > 1:
-                            item = item[item == get_analyte_name(a)]
-                        if len(item) == 1:
-                            ad[a] = item[0]
-                        else:
-                            warns.append(f'   No {a} value for {srm}.')
-
-                analyte_srm_link[srm] = ad
-
-                # find denominator
-                denom = srmsub.loc[ad[self.internal_standard]]
-                # calculate denominator composition (multiplier to account for stoichiometry,
-                # e.g. if internal standard is Na, N will be 2 if measured in SRM as Na2O)
-                N = float(decompose_molecule(ad[self.internal_standard])[internal_el])
-
-                # calculate molar ratio
-                ind = (srm, list(ad.values()))
-                srmdat.loc[ind, 'mol_ratio'] = srmdat.loc[ind, 'mol/g'] / (denom['mol/g'] * N)
-                srmdat.loc[ind, 'mol_ratio_err'] = (((srmdat.loc[ind, 'mol/g_err'] / srmdat.loc[ind, 'mol/g'])**2 +
-                                                    (denom['mol/g_err'] / denom['mol/g']))**0.5 *
-                                                    srmdat.loc[ind, 'mol_ratio'])  # propagate uncertainty
-
-            srmdat.dropna(subset=['mol_ratio'], inplace=True)
-            
-            # where uncertainties are missing, replace with zeros
-            srmdat.loc[srmdat.mol_ratio_err.isnull(), 'mol_ratio_err'] = 0
-
-            # compile stand-alone table of SRM values
-            srmtab = pd.DataFrame(index=srms_used, columns=pd.MultiIndex.from_product([self.analytes, ['mean', 'err']]))
-            for srm, ad in analyte_srm_link.items():
-                for a, k in ad.items():
-                    srmtab.loc[srm, (a, 'mean')] = srmdat.loc[(srm, k), 'mol_ratio']
-                    srmtab.loc[srm, (a, 'err')] = srmdat.loc[(srm, k), 'mol_ratio_err']
-
-            # record outputs
-            self.srmdat = srmdat  # the full SRM table
-            self._analyte_srmdat_link = analyte_srm_link  # dict linking analyte names to rows in srmdat
-            self.srmtab = srmtab.reindex(self.analytes_sorted(), level=0, axis=1).astype(float)  # a summary of relevant mol/mol values only
-
-            # record which analytes have missing CRM data
-            means = self.srmtab.loc[:, idx[:, 'mean']]
-            means.columns = means.columns.droplevel(1)
-            self._analytes_missing_srm = means.columns.values[means.isnull().any()]
-            self._srm_id_analytes = means.columns.values[~means.isnull().any()]
-            self._calib_analytes = means.columns.values[~means.isnull().all()]
-
-            # Print any warnings
-            if len(warns) > 0:
-                print('WARNING: Some analytes are not present in the SRM database:')
-                print('\n'.join(warns))
-    
-    def srm_compile_measured(self, n_min=10, focus_stage='ratios'):
-        """
-        Compile mean and standard errors of measured SRMs
-
-        Parameters
-        ----------
-        n_min : int
-            The minimum number of points to consider as a valid measurement.
-            Default = 10.
-        """
-        warns = []
-        # compile mean and standard errors of samples
-        for s in self.stds:
-            s_stdtab = pd.DataFrame(columns=pd.MultiIndex.from_product([s.analytes, ['err', 'mean']]))
-            s_stdtab.index.name = 'uTime'
-
-            if not s.n > 0:
-                s.stdtab = s_stdtab
-                continue
-
-            for n in range(1, s.n + 1):
-                ind = s.ns == n
-                if sum(ind) >= n_min:
-                    for a in s.analytes:
-                        aind = ind & ~np.isnan(nominal_values(s.data[focus_stage][a]))
-                        s_stdtab.loc[np.nanmean(s.uTime[s.ns == n]),
-                                   (a, 'mean')] = np.nanmean(nominal_values(s.data[focus_stage][a][aind]))
-                        s_stdtab.loc[np.nanmean(s.uTime[s.ns == n]),
-                                   (a, 'err')] = np.nanstd(nominal_values(s.data[focus_stage][a][aind])) / np.sqrt(sum(aind))
-                else:
-                    warns.append('   Ablation {:} of SRM measurement {:} ({:} points)'.format(n, s.sample, sum(ind)))
-
-            # sort column multiindex
-            s_stdtab = s_stdtab.loc[:, s_stdtab.columns.sort_values()]
-            # sort row index
-            s_stdtab.sort_index(inplace=True)
-
-            # create 'SRM' column for naming SRM
-            s_stdtab.loc[:, 'STD'] = s.sample
-
-            s.stdtab = s_stdtab
-
-        if len(warns) > 0:
-            print('WARNING: Some SRM ablations have been excluded because they do not contain enough data:')
-            print('\n'.join(warns))
-            print("To *include* these ablations, reduce the value of n_min (currently {:})".format(n_min))
-
-        # compile them into a table
-        stdtab = pd.concat([s.stdtab for s in self.stds]).apply(pd.to_numeric, 1, errors='ignore')
-        stdtab = stdtab.reindex(self.analytes_sorted() + ['STD'], level=0, axis=1)
-
-        # identify groups of consecutive SRMs
-        ts = stdtab.index.values
-        start_times = [s.uTime[0] for s in self.data.values()]
-
-        lastpos = sum(ts[0] > start_times)
-        group = [1]
-        for t in ts[1:]:
-            pos = sum(t > start_times)
-            rpos = pos - lastpos
-            if rpos <= 1:
-                group.append(group[-1])
-            else:
-                group.append(group[-1] + 1)
-            lastpos = pos
-
-        stdtab.loc[:, 'group'] = group
-        # calculate centre time for the groups
-        stdtab.loc[:, 'gTime'] = np.nan
-
-        for g, d in stdtab.groupby('group'):
-            ind = stdtab.group == g
-            stdtab.loc[ind, 'gTime'] = stdtab.loc[ind].index.values.mean()
-
-        self.stdtab = stdtab
-
-    def srm_id_auto(self, srms_used=['NIST610', 'NIST612', 'NIST614'], analytes=None, n_min=10, reload_srm_database=False):
-        """
-        Function for automarically identifying SRMs using KMeans clustering.
-
-        KMeans is performed on the log of SRM composition, which aids separation
-        of relatively similar SRMs within a large compositional range.
-
-        Parameters
-        ----------
-        srms_used : iterable
-            Which SRMs have been used. Must match SRM names
-            in SRM database *exactly* (case sensitive!).
-        analytes : array_like
-            Which analytes to base the identification on. If None,
-            all analytes are used (default).
-        n_min : int
-            The minimum number of data points a SRM measurement
-            must contain to be included.
-        reload_srm_database : bool
-            Whether or not to re-load the SRM database before running the function.
-        """
-        # TODO: srm_id_plot!
-        if isinstance(srms_used, str):
-            srms_used = [srms_used]
-        
-        # compile measured SRM data
-        self.srm_compile_measured(n_min)
-
-        # load SRM database
-        self.srm_load_database(srms_used, reload_srm_database)
-
-        if analytes is None:
-            analytes = self._srm_id_analytes
-        else:
-            analytes = [a for a in analytes if a in self._srm_id_analytes]
-
-        # get and scale mean srm values for all analytes
-        srmid = self.srmtab.loc[:, idx[analytes, 'mean']]
-        _srmid = scale(np.log(srmid))
-        srm_labels = srmid.index.values
-
-        # get and scale measured srm values for all analytes
-        stdid = self.stdtab.loc[:, idx[analytes, 'mean']]
-        _stdid = scale(np.log(stdid))
-
-        # fit KMeans classifier to srm database
-        classifier = KMeans(len(srms_used)).fit(_srmid)
-        # apply classifier to measured data
-        std_classes = classifier.predict(_stdid)
-
-        # get srm names from classes
-        std_srm_labels = np.array([srm_labels[np.argwhere(classifier.labels_ == i)][0][0] for i in std_classes])
-
-        self.stdtab.loc[:, 'SRM'] = std_srm_labels
-        self.srms_ided = True
-
-        self.srm_build_calib_table()
-
-    def srm_build_calib_table(self):
-        """
-        Combine SRM database values and identified measured values into a calibration database.
-        """
-        caltab = self.stdtab.reset_index()
-        caltab.set_index(['gTime', 'uTime'], inplace=True)
-        levels = ['meas_' + c if c != '' else c for c in caltab.columns.levels[1]]
-        caltab.columns.set_levels(levels, 1, inplace=True)
-
-        for a in self.analytes:
-            if a == self.internal_standard:
-                continue
-
-            caltab.loc[:, (a, 'srm_mean')] = self.srmtab.loc[caltab.SRM, (a, 'mean')].values
-            caltab.loc[:, (a, 'srm_err')] = self.srmtab.loc[caltab.SRM, (a, 'err')].values
-            
-        self.caltab = caltab.reindex(self.stdtab.columns.levels[0], axis=1, level=0)
-
-    
-    # def srm_id_auto(self, srms_used=['NIST610', 'NIST612', 'NIST614'], n_min=10, reload_srm_database=False):
-    #     """
-    #     Function for automarically identifying SRMs
-    
-    #     Parameters
-    #     ----------
-    #     srms_used : iterable
-    #         Which SRMs have been used. Must match SRM names
-    #         in SRM database *exactly* (case sensitive!).
-    #     n_min : int
-    #         The minimum number of data points a SRM measurement
-    #         must contain to be included.
-    #     """
-    #     if isinstance(srms_used, str):
-    #         srms_used = [srms_used]
-            
-    #     # get mean and standard deviations of measured standards
-    #     self.srm_compile_measured(n_min)
-    #     stdtab = self.stdtab.copy()
-    #     stdtab.loc[:, 'SRM'] = ''
-
-
-    #     # load corresponding SRM database
-    #     self.srm_load_database(srms_used, reload_srm_database)
-
-    #     # create blank srm table
-    #     srm_tab = self.srmdat.loc[:, ['mol_ratio', 'element']].reset_index().pivot(index='SRM', columns='element', values='mol_ratio')
-
-    #     # Auto - ID STDs
-    #     # 1. identify elements in measured SRMS with biggest range of values
-    #     meas_tab = stdtab.loc[:, (slice(None), 'mean')]  # isolate means of standards
-    #     meas_tab.columns = meas_tab.columns.droplevel(1)  # drop 'mean' column names
-    #     meas_tab.columns = [re.findall('[A-Za-z]+', a)[0] for a in meas_tab.columns]  # rename to element names
-    #     meas_tab = meas_tab.T.groupby(level=0).first().T  # remove duplicate columns
-
-    #     ranges = nominal_values(meas_tab.apply(lambda a: np.ptp(a) / np.nanmean(a), 0))  # calculate relative ranges of all elements
-    #     # (used as weights later)
-
-    #     # 2. Work out which standard is which
-    #     # normalise all elements between 0-1
-    #     def normalise(a):
-    #         a = nominal_values(a)
-    #         if np.nanmin(a) < np.nanmax(a):
-    #             return (a - np.nanmin(a)) / np.nanmax(a - np.nanmin(a))
-    #         else:
-    #             return np.ones(a.shape)
-
-    #     nmeas = meas_tab.apply(normalise, 0)
-    #     nmeas.dropna(1, inplace=True)  # remove elements with NaN values
-    #     # nmeas.replace(np.nan, 1, inplace=True)
-    #     nsrm_tab = srm_tab.apply(normalise, 0)
-    #     nsrm_tab.dropna(1, inplace=True)
-    #     # nsrm_tab.replace(np.nan, 1, inplace=True)
-
-    #     for uT, r in nmeas.iterrows():  # for each standard...
-    #         idx = np.nansum(((nsrm_tab - r) * ranges)**2, 1)
-    #         idx = abs((nsrm_tab - r) * ranges).sum(1)
-    #         # calculate the absolute difference between the normalised elemental
-    #         # values for each measured SRM and the SRM table. Each element is
-    #         # multiplied by the relative range seen in that element (i.e. range / mean
-    #         # measuerd value), so that elements with a large difference are given
-    #         # more importance in identifying the SRM.   
-    #         # This produces a table, where wach row contains the difference between
-    #         # a known vs. measured SRM. The measured SRM is identified as the SRM that
-    #         # has the smallest weighted sum value.
-    #         stdtab.loc[uT, 'SRM'] = srm_tab.index[idx == min(idx)].values[0]
-
-    #     # calculate mean time for each SRM
-    #     # reset index and sort
-    #     stdtab.reset_index(inplace=True)
-    #     stdtab.sort_index(1, inplace=True)
-    #     # isolate STD and uTime
-    #     uT = stdtab.loc[:, ['gTime', 'STD']].set_index('STD')
-    #     uT.sort_index(inplace=True)
-    #     uTm = uT.groupby(level=0).mean()  # mean uTime for each SRM
-    #     # replace uTime values with means
-    #     stdtab.set_index(['STD'], inplace=True)
-    #     stdtab.loc[:, 'gTime'] = uTm
-    #     # reset index
-    #     stdtab.reset_index(inplace=True)
-    #     stdtab.set_index(['STD', 'SRM', 'gTime'], inplace=True)
-
-    #     # combine to make SRM reference tables
-    #     srmtabs = Bunch()
-    #     for a in self.analytes:
-    #         el = re.findall('[A-Za-z]+', a)[0]
-
-    #         sub = stdtab.loc[:, a]
-
-    #         srmsub = self.srmdat.loc[self.srmdat.element == el, ['mol_ratio', 'mol_ratio_err']]
-
-    #         srmtab = sub.join(srmsub)
-    #         srmtab.columns = ['meas_err', 'meas_mean', 'srm_mean', 'srm_err']
-
-    #         srmtabs[a] = srmtab
-
-    #     self.srmtabs = pd.concat(srmtabs).apply(nominal_values).sort_index()
-    #     self.srmtabs.dropna(subset=['srm_mean'], inplace=True)
-    #     # replace any nan error values with zeros - nans cause problems later.
-    #     self.srmtabs.loc[:, ['meas_err', 'srm_err']] = self.srmtabs.loc[:, ['meas_err', 'srm_err']].replace(np.nan, 0)
-
-    #     # remove internal standard from calibration elements
-    #     self.srmtabs.drop(self.internal_standard, level=0, inplace=True)
-
-    #     self.srms_ided = True
-    #     return
 
     def clear_calibration(self):
         if self.srms_ided:
@@ -1720,264 +841,10 @@ class analyse(object):
         -------
         None
         """
-        if analytes is None:
-            analytes = self.analytes_sorted(self.analytes.difference([self.internal_standard]))
-
-        elif isinstance(analytes, str):
-            analytes = [analytes]
-
-        if isinstance(srms_used, str):
-            srms_used = [srms_used]
-
-        if not hasattr(self, 'srmtabs'):
-            self.srm_id_auto(srms_used=srms_used, n_min=n_min, reload_srm_database=reload_srm_database)
-
-        # make container for calibration params
-        gTime = np.asanyarray(self.caltab.index.levels[0])
-        if not hasattr(self, 'calib_params'):
-            self.calib_params = pd.DataFrame(columns=pd.MultiIndex.from_product([analytes, ['m']]),
-                                             index=gTime)
-
-        if zero_intercept:
-            fn  = lambda x, m: x * m
-        else:
-            fn = lambda x, m, c: x * m + c
-
-        for a in analytes:
-            if zero_intercept:
-                if (a, 'c') in self.calib_params:
-                    self.calib_params.drop((a, 'c'), 1, inplace=True)
-            if drift_correct:
-                for g in gTime:
-                    if self.caltab.loc[g].size == 0:
-                        continue
-                    meas = self.caltab.loc[g, (a, 'meas_mean')].values
-                    meas_err = self.caltab.loc[g, (a, 'meas_err')].values
-                    srm = self.caltab.loc[g, (a, 'srm_mean')].values
-                    srm_err = self.caltab.loc[g, (a, 'srm_err')].values
-                    # TODO: replace curve_fit with Sambridge's 2D likelihood function for better uncertainty incorporation?
-                    sigma = np.sqrt(meas_err**2 + srm_err**2)
-                    if len(meas) > 1:
-                        # multiple SRMs - do a regression
-                        p, cov = curve_fit(fn, meas, srm, sigma=sigma)
-                        pe = unc.correlated_values(p, cov)                
-                        self.calib_params.loc[g, (a, 'm')] = pe[0]
-                        if not zero_intercept:
-                            self.calib_params.loc[g, (a, 'c')] = pe[1]
-                    else:
-                        # deal with case where there's only one datum
-                        self.calib_params.loc[g, (a, 'm')] = (un.uarray(srm, srm_err) / 
-                                                              un.uarray(meas, meas_err))[0]
-                        if not zero_intercept:
-                            self.calib_params.loc[g, (a, 'c')] = 0
-            else:
-                meas = self.caltab.loc[:, (a, 'meas_mean')].values
-                meas_err = self.caltab.loc[:, (a, 'meas_err')].values
-                srm = self.caltab.loc[:, (a, 'srm_mean')].values
-                srm_err = self.caltab.loc[:, (a, 'srm_err')].values
-                # TODO: replace curve_fit with Sambridge's 2D likelihood function for better uncertainty incorporation?
-                sigma = np.sqrt(meas_err**2 + srm_err**2)
-                
-                if len(meas) > 1:
-                    p, cov = curve_fit(fn, meas, srm, sigma=sigma)
-                    pe = unc.correlated_values(p, cov)                
-                    self.calib_params.loc[:, (a, 'm')] = pe[0]
-                    if not zero_intercept:
-                        self.calib_params.loc[:, (a, 'c')] = pe[1]
-                else:
-                    self.calib_params.loc[:, (a, 'm')] = (un.uarray(srm, srm_err) / 
-                                                          un.uarray(meas, meas_err))[0]
-                    if not zero_intercept:
-                        self.calib_params.loc[:, (a, 'c')] = 0
-
-        if self.calib_params.index.min() == 0:
-            self.calib_params.drop(0, inplace=True)
-            self.calib_params.drop(self.calib_params.index.max(), inplace=True)
-        self.calib_params.loc[0, :] = self.calib_params.loc[self.calib_params.index.min(), :]
-        maxuT = np.max([d.uTime.max() for d in self.data.values()])  # calculate max uTime
-        self.calib_params.loc[maxuT, :] = self.calib_params.loc[self.calib_params.index.max(), :]
-        # sort indices for slice access
-        self.calib_params.sort_index(1, inplace=True)
-        self.calib_params.sort_index(0, inplace=True)
-
-        # calculcate interpolators for applying calibrations
-        self.calib_ps = Bunch()
-        for a in analytes:
-            # TODO: revisit un_interp1d to see whether it plays well with correlated values. 
-            # Possible re-write to deal with covariance matrices?
-            self.calib_ps[a] = {'m': un_interp1d(self.calib_params.index.values,
-                                                self.calib_params.loc[:, (a, 'm')].values)}
-            if not zero_intercept:
-                self.calib_ps[a]['c'] = un_interp1d(self.calib_params.index.values,
-                                                    self.calib_params.loc[:, (a, 'c')].values)
-
-        with self.pbar.set(total=len(self.data), desc='Applying Calibrations') as prog:
-            for d in self.data.values():
-                d.calibrate(self.calib_ps, analytes)
-                prog.update()
-
-        # record SRMs used for plotting
-        markers = 'osDsv<>PX'  # for future implementation of SRM-specific markers.
-        if not hasattr(self, 'srms_used'):
-            self.srms_used = set(srms_used)
-        else:
-            self.srms_used.update(srms_used)
-        self.srm_mdict = {k: markers[i] for i, k in enumerate(self.srms_used)}
-
-        self.stages_complete.update(['calibrated'])
-        self.focus_stage = 'calibrated'
-
+        self.calibrated = Calibrator(self.ratio_calculated, analytes=analytes, drift_correct=drift_correct,
+                                     srms_used=srms_used, zero_intercept=zero_intercept,
+                                     n_min=n_min, reload_srm_database=reload_srm_database)
         return
-
-    # def calibrate(self, analytes=None, drift_correct=True,
-    #               srms_used=['NIST610', 'NIST612', 'NIST614'],
-    #               zero_intercept=True, n_min=10, reload_srm_database=False):
-    #     """
-    #     Calibrates the data to measured SRM values.
-
-    #     Assumes that y intercept is zero.
-
-    #     Parameters
-    #     ----------  
-    #     analytes : str or iterable
-    #         Which analytes you'd like to calibrate. Defaults to all.
-    #     drift_correct : bool
-    #         Whether to pool all SRM measurements into a single calibration,
-    #         or vary the calibration through the run, interpolating
-    #         coefficients between measured SRMs.
-    #     srms_used : str or iterable
-    #         Which SRMs have been measured. Must match names given in
-    #         SRM data file *exactly*.
-    #     n_min : int
-    #         The minimum number of data points an SRM measurement
-    #         must have to be included.
-
-    #     Returns
-    #     -------
-    #     None
-    #     """
-    #     if analytes is None:
-    #         analytes = self.analytes.difference(self.internal_standard)
-    #     elif isinstance(analytes, str):
-    #         analytes = [analytes]
-
-    #     if isinstance(srms_used, str):
-    #         srms_used = [srms_used]
-
-    #     if not hasattr(self, 'srmtabs'):
-    #         self.srm_id_auto(srms_used=srms_used, n_min=n_min, reload_srm_database=reload_srm_database)
-
-    #     # make container for calibration params
-    #     if not hasattr(self, 'calib_params'):
-    #         gTime = self.stdtab.gTime.unique()
-    #         self.calib_params = pd.DataFrame(columns=pd.MultiIndex.from_product([analytes, ['m']]),
-    #                                         index=gTime)
-
-    #     calib_analytes = self.srmtabs.index.get_level_values(0).unique()
-
-    #     if zero_intercept:
-    #         fn  = lambda x, m: x * m
-    #     else:
-    #         fn = lambda x, m, c: x * m + c
-
-    #     for a in calib_analytes:
-    #         if zero_intercept:
-    #             if (a, 'c') in self.calib_params:
-    #                 self.calib_params.drop((a, 'c'), 1, inplace=True)
-    #         if drift_correct:
-    #             for g in self.stdtab.gTime.unique():
-    #                 ind = idx[a, :, :, g]
-    #                 if self.srmtabs.loc[ind].size == 0:
-    #                     continue
-    #                 # try:
-    #                 meas = self.srmtabs.loc[ind, 'meas_mean']
-    #                 srm = self.srmtabs.loc[ind, 'srm_mean']
-    #                 # TODO: replace curve_fit with Sambridge's 2D likelihood function for better uncertainty incorporation.
-    #                 merr = self.srmtabs.loc[ind, 'meas_err']
-    #                 serr = self.srmtabs.loc[ind, 'srm_err']
-    #                 sigma = np.sqrt(merr**2 + serr**2)
-
-    #                 if len(meas) > 1:
-    #                     # multiple SRMs - do a regression
-    #                     p, cov = curve_fit(fn, meas, srm, sigma=sigma)
-    #                     pe = unc.correlated_values(p, cov)                
-    #                     self.calib_params.loc[g, (a, 'm')] = pe[0]
-    #                     if not zero_intercept:
-    #                         self.calib_params.loc[g, (a, 'c')] = pe[1]
-    #                 else:
-    #                     # deal with case where there's only one datum
-    #                     self.calib_params.loc[g, (a, 'm')] = (un.uarray(srm, serr) / 
-    #                                                           un.uarray(meas, merr))[0]
-    #                     if not zero_intercept:
-    #                         self.calib_params.loc[g, (a, 'c')] = 0
-
-    #                 # This should be obsolete, because no-longer sourcing locator from calib_params index.
-    #                 # except KeyError:
-    #                 #     # If the calibration is being recalculated, calib_params
-    #                 #     # will have t=0 and t=max(uTime) values that are outside
-    #                 #     # the srmtabs index.
-    #                 #     # If this happens, drop them, and re-fill them at the end.
-    #                 #     self.calib_params.drop(g, inplace=True)
-    #         else:
-    #             ind = idx[a, :, :, :]
-    #             meas = self.srmtabs.loc[ind, 'meas_mean']
-    #             srm = self.srmtabs.loc[ind, 'srm_mean']
-    #             merr = self.srmtabs.loc[ind, 'meas_err']
-    #             serr = self.srmtabs.loc[ind, 'srm_err']
-    #             sigma = np.sqrt(merr**2 + serr**2)
-                
-    #             if len(meas) > 1:
-    #                 p, cov = curve_fit(fn, meas, srm, sigma=sigma)
-    #                 pe = unc.correlated_values(p, cov)                
-    #                 self.calib_params.loc[:, (a, 'm')] = pe[0]
-    #                 if not zero_intercept:
-    #                     self.calib_params.loc[:, (a, 'c')] = pe[1]
-    #             else:
-    #                 self.calib_params.loc[:, (a, 'm')] = (un.uarray(srm, serr) / 
-    #                                                       un.uarray(meas, merr))[0]
-    #                 if not zero_intercept:
-    #                     self.calib_params.loc[:, (a, 'c')] = 0
-
-    #     # if fill:
-    #     # fill in uTime=0 and uTime = max cases for interpolation
-    #     if self.calib_params.index.min() == 0:
-    #         self.calib_params.drop(0, inplace=True)
-    #         self.calib_params.drop(self.calib_params.index.max(), inplace=True)
-    #     self.calib_params.loc[0, :] = self.calib_params.loc[self.calib_params.index.min(), :]
-    #     maxuT = np.max([d.uTime.max() for d in self.data.values()])  # calculate max uTime
-    #     self.calib_params.loc[maxuT, :] = self.calib_params.loc[self.calib_params.index.max(), :]
-    #     # sort indices for slice access
-    #     self.calib_params.sort_index(1, inplace=True)
-    #     self.calib_params.sort_index(0, inplace=True)
-
-    #     # calculcate interpolators for applying calibrations
-    #     self.calib_ps = Bunch()
-    #     for a in analytes:
-    #         # TODO: revisit un_interp1d to see whether it plays well with correlated values. 
-    #         # Possible re-write to deal with covariance matrices?
-    #         self.calib_ps[a] = {'m': un_interp1d(self.calib_params.index.values,
-    #                                             self.calib_params.loc[:, (a, 'm')].values)}
-    #         if not zero_intercept:
-    #             self.calib_ps[a]['c'] = un_interp1d(self.calib_params.index.values,
-    #                                                 self.calib_params.loc[:, (a, 'c')].values)
-
-    #     with self.pbar.set(total=len(self.data), desc='Applying Calibrations') as prog:
-    #         for d in self.data.values():
-    #             d.calibrate(self.calib_ps, analytes)
-    #             prog.update()
-
-    #     # record SRMs used for plotting
-    #     markers = 'osDsv<>PX'  # for future implementation of SRM-specific markers.
-    #     if not hasattr(self, 'srms_used'):
-    #         self.srms_used = set(srms_used)
-    #     else:
-    #         self.srms_used.update(srms_used)
-    #     self.srm_mdict = {k: markers[i] for i, k in enumerate(self.srms_used)}
-
-    #     self.stages_complete.update(['calibrated'])
-    #     self.focus_stage = 'calibrated'
-
-    #     return
 
 
     # data filtering
@@ -2009,7 +876,7 @@ class analyse(object):
         """
         if sample_concs is None:
             sample_concs = os.path.join(self.export_dir, 'internal_standard_massfrac.csv')
-        
+
         return pd.read_csv(sample_concs, index_col=0)
 
 
@@ -2045,12 +912,12 @@ class analyse(object):
             isc = self.read_internal_standard_concs(isc)
 
         if not isinstance(isc, pd.core.frame.DataFrame):
-            with self.pbar.set(total=len(self.data), desc='Calculating Mass Fractions') as prog:        
+            with self.pbar.set(total=len(self.data), desc='Calculating Mass Fractions') as prog:
                 for d in self.data.values():
                     d.calc_mass_fraction(isc, analytes, analyte_masses)
-                    prog.update() 
+                    prog.update()
         else:
-            with self.pbar.set(total=len(self.data), desc='Calculating Mass Fractions') as prog:        
+            with self.pbar.set(total=len(self.data), desc='Calculating Mass Fractions') as prog:
                 for k, d in self.data.items():
                     if k in isc.index:
                         d.calc_mass_fraction(isc.loc[k].values[0], analytes, analyte_masses)
@@ -2300,7 +1167,7 @@ class analyse(object):
         samples = self._get_samples(subset)
 
         self.minimal_analytes.update([analyte])
-        
+
         with self.pbar.set(total=len(samples), desc='Gradient Threshold Filter') as prog:
             for s in samples:
                 self.data[s].filter_gradient_threshold(analyte, win, threshold)
@@ -2484,13 +1351,13 @@ class analyse(object):
                                                 sort=sort,
                                                 **kwargs)
                     prog.update()
-        
+
         if level == 'population':
             if isinstance(sort, bool):
                 sort_by = 0
             else:
                 sort_by = sort
-            
+
             name = '_'.join(analytes) + '_{}'.format(method)
 
             self.fit_classifier(name=name, analytes=analytes, method=method,
@@ -2685,7 +1552,7 @@ class analyse(object):
             outdir = self.report_dir + '/correlations/'
         if not os.path.isdir(outdir):
             os.mkdir(outdir)
-        
+
         if subset is not None:
             samples = self._get_samples(subset)
         elif samples is None:
@@ -2701,7 +1568,7 @@ class analyse(object):
                 plt.close(f)
                 prog.update()
         return
-        
+
 
 
     @_log
@@ -2841,7 +1708,7 @@ class analyse(object):
 
         for s in samples:
             self.data[s].filt.clear()
-    
+
     @_log
     def filter_defragment(self, threshold, mode='include', filt=True, samples=None, subset=None):
         """
@@ -2879,7 +1746,7 @@ class analyse(object):
                                   filt=filters.defrag(f, threshold, mode),
                                   info='Defrag {:s} filter with threshold {:.0f}'.format(mode, threshold),
                                   params=(threshold, mode, filt, samples, subset))
-    
+
     @_log
     def filter_exclude_downhole(self, threshold, filt=True, samples=None, subset=None):
         """
@@ -2945,10 +1812,10 @@ class analyse(object):
                       '{percent:4.0f}'.format(percent=pcrm))
 
         return rminfo
-    
+
     @_log
     def optimise_signal(self, analytes, min_points=5,
-                        threshold_mode='kde_first_max', 
+                        threshold_mode='kde_first_max',
                         threshold_mult=1., x_bias=0, filt=True,
                         weights=None, mode='minimise',
                         samples=None, subset=None):
@@ -3019,10 +1886,10 @@ class analyse(object):
                 if e != '':
                     errs.append(e)
                 prog.update()
-        
+
         if len(errs) > 0:
             print('\nA Few Problems:\n' + '\n'.join(errs) + '\n\n  *** Check Optimisation Plots ***')
-    
+
     @_log
     def optimisation_plots(self, overlay_alpha=0.5, samples=None, subset=None, **kwargs):
         """
@@ -3047,11 +1914,11 @@ class analyse(object):
         outdir=self.report_dir + '/optimisation_plots/'
         if not os.path.isdir(outdir):
             os.mkdir(outdir)
-        
+
         with self.pbar.set(total=len(samples), desc='Drawing Plots') as prog:
             for s in samples:
                 figs = self.data[s].optimisation_plot(overlay_alpha, **kwargs)
-                
+
                 n = 1
                 for f, _ in figs:
                     if f is not None:
@@ -3064,8 +1931,8 @@ class analyse(object):
     # plot calibrations
     @_log
     def calibration_plot(self, analytes=None, datarange=True, loglog=False, ncol=3, srm_group=None, percentile_data_cutoff=85, save=True):
-        return plot.calibration_plot(self=self, analytes=analytes, datarange=datarange, 
-                                     loglog=loglog, ncol=ncol, srm_group=srm_group, 
+        return plot.calibration_plot(self=self, analytes=analytes, datarange=datarange,
+                                     loglog=loglog, ncol=ncol, srm_group=srm_group,
                                      percentile_data_cutoff=percentile_data_cutoff, save=save)
 
     # set the focus attribute for specified samples
@@ -3105,7 +1972,7 @@ class analyse(object):
         """
         if samples is not None:
             subset = self.make_subset(samples)
-        
+
         if subset is None:
             subset = 'All_Analyses'
 
@@ -3143,7 +2010,7 @@ class analyse(object):
 
         if samples is not None:
             subset = self.make_subset(samples)
-        
+
         samples = self._get_samples(subset)
 
         # t = 0
@@ -3295,7 +2162,7 @@ class analyse(object):
         if i < ncol * nrow:
             for ax in axs.flatten()[i:]:
                 ax.set_visible(False)
-        
+
         fig.tight_layout()
 
         return fig, axs
@@ -3356,7 +2223,7 @@ class analyse(object):
 
         if save or isinstance(save, str):
             if isinstance(save, str):
-                fig.savefig(os.path.join(self.report_dir, save), dpi=200)            
+                fig.savefig(os.path.join(self.report_dir, save), dpi=200)
             else:
                 fig.savefig(os.path.join(self.report_dir, 'crossplot.png'), dpi=200)
 
@@ -3467,7 +2334,7 @@ class analyse(object):
                                     bins=bins, logy=logy, cmap=cmap)
 
         return fig, axes
-    
+
     def filter_effect(self, analytes=None, stats=['mean', 'std'], filt=True):
         """
         Quantify the effects of the active filters.
@@ -3492,17 +2359,17 @@ class analyse(object):
             analytes = self.analytes
         if isinstance(analytes, str):
             analytes = [analytes]
-        
+
         # calculate filtered and unfiltered stats
         self.sample_stats(analytes, stats=stats, filt=False)
         suf = self.stats.copy()
         self.sample_stats(analytes, stats=stats, filt=filt)
         sf = self.stats.copy()
-        
+
         # create dataframe for results
         cols = []
         for s in self.stats_calced:
-            cols += ['unfiltered_{:}'.format(s), 'filtered_{:}'.format(s)] 
+            cols += ['unfiltered_{:}'.format(s), 'filtered_{:}'.format(s)]
 
         comp = pd.DataFrame(index=self.samples,
                             columns=pd.MultiIndex.from_arrays([cols, [None] * len(cols)]))
@@ -3524,11 +2391,11 @@ class analyse(object):
             rat = comp.loc[:, 'filtered_{:}'.format(s)] / comp.loc[:, 'unfiltered_{:}'.format(s)]
             rat.columns = pd.MultiIndex.from_product([['{:}_ratio'.format(s)], rat.columns])
             rats.append(rat)
-        
+
         # join it all up
         comp = comp.join(pd.concat(rats, 1))
         comp.sort_index(1, inplace=True)
-        
+
         return comp.loc[:, (pd.IndexSlice[:], pd.IndexSlice[analytes])]
 
     def crossplot_filters(self, filter_string, analytes=None,
@@ -3704,7 +2571,7 @@ class analyse(object):
             samples = self.subsets['All_Analyses']
         elif isinstance(samples, str):
             samples = [samples]
-        
+
         with self.pbar.set(total=len(samples), desc='Drawing Plots') as prog:
             for s in samples:
                 f, a = self.data[s].tplot(analytes=analytes, figsize=figsize,
@@ -3972,7 +2839,7 @@ class analyse(object):
                 self.stats[s] = self.data[s].stats
                 prog.update()
 
-        return 
+        return
 
     @_log
     def ablation_times(self, samples=None, subset=None):
@@ -4292,7 +3159,7 @@ class analyse(object):
             with open('%s/%s_%s.csv' % (outdir, s, focus_stage), 'w') as f:
                 f.write(header)
                 f.write(csv)
-        
+
         if zip_archive:
             utils.zipdir(outdir, delete=True)
 
@@ -4313,9 +3180,9 @@ class analyse(object):
         if header is None:
             header = self._log_header()
 
-        loc = logging.write_logfile(self.log, header, 
+        loc = logging.write_logfile(self.log, header,
                                     os.path.join(directory, logname))
-        
+
         return loc
 
     def minimal_export(self, target_analytes=None, path=None):
@@ -4359,7 +3226,7 @@ class analyse(object):
         log_header = ['# Minimal Reproduction Dataset Exported from LATOOLS on %s' %
                       (time.strftime('%Y:%m:%d %H:%M:%S')),
                       'data_folder :: ./data/']
-                      
+
         if hasattr(self, 'srmdat'):
             log_header.append('srm_table :: ./srm.table')
 
@@ -4391,7 +3258,7 @@ class analyse(object):
 
         if zip_archive:
             utils.zipdir(directory=path, delete=True)
-        
+
         return
 
 
@@ -4434,9 +3301,9 @@ def reproduce(past_analysis, plotting=False, data_folder=None,
     elif 'analysis.lalog' in past_analysis:
         logpath = past_analysis
     else:
-        raise ValueError(('\n\n{} is not a valid input.\n\n' + 
+        raise ValueError(('\n\n{} is not a valid input.\n\n' +
                           'Must be one of:\n' +
-                          '  - A .zip file exported by latools\n' + 
+                          '  - A .zip file exported by latools\n' +
                           '  - An analysis.lalog file\n' +
                           '  - A directory containing an analysis.lalog files\n'))
 
