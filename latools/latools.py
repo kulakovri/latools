@@ -134,6 +134,7 @@ class analyse(object):
                  dataformat=dataformat, extension=extension, srm_identifier=srm_identifier,
                  cmap=cmap, time_format=time_format, internal_standard=internal_standard,
                  names=names, srm_file=srm_file, pbar=pbar)
+        self.move_attributes_from_previous_stage(self.raw)
 
 
     def move_attributes_from_previous_stage(self, rawloader):
@@ -376,10 +377,10 @@ class analyse(object):
             (min, max) pairs identifying the boundaries of contiguous
             True regions in the boolean arrays.
         """
-        self.autoranged = AutoRanger(self.despiked, analyte=analyte, gwin=gwin, swin=swin, win=win,
+        autoranged = AutoRanger(self, analyte=analyte, gwin=gwin, swin=swin, win=win,
                   on_mult=on_mult, off_mult=off_mult,
                   transform=transform, ploterrs=ploterrs, focus_stage=focus_stage)
-        return
+        self.move_attributes_from_previous_stage(autoranged)
 
     @_log
     def despike(self, expdecay_despiker=False, exponent=None,
@@ -428,105 +429,11 @@ class analyse(object):
         -------
         None
         """
-        self.despiked = Despiker(self.raw, expdecay_despiker=expdecay_despiker, exponent=exponent,
+        despiked = Despiker(self, expdecay_despiker=expdecay_despiker, exponent=exponent,
                 noise_despiker=noise_despiker, win=win, nlim=nlim., exponentplot=exponentplot,
                 maxiter=maxiter, autorange_kwargs=autorange_kwargs, focus_stage=focus_stage)
-        return
+        self.move_attributes_from_previous_stage(despiked)
 
-    # functions for background correction
-    def get_background(self, n_min=10, n_max=None, focus_stage='despiked', bkg_filter=False, f_win=5, f_n_lim=3):
-        """
-        Extract all background data from all samples on universal time scale.
-        Used by both 'polynomial' and 'weightedmean' methods.
-
-        Parameters
-        ----------
-        n_min : int
-            The minimum number of points a background region must
-            have to be included in calculation.
-        n_max : int
-            The maximum number of points a background region must
-            have to be included in calculation.
-        filter : bool
-            If true, apply a rolling filter to the isolated background regions
-            to exclude regions with anomalously high values. If True, two parameters
-            alter the filter's behaviour:
-        f_win : int
-            The size of the rolling window
-        f_n_lim : float
-            The number of standard deviations above the rolling mean
-            to set the threshold.
-        focus_stage : str
-            Which stage of analysis to apply processing to. 
-            Defaults to 'despiked' if present, or 'rawdata' if not. 
-            Can be one of:
-            * 'rawdata': raw data, loaded from csv file.
-            * 'despiked': despiked data.
-            * 'signal'/'background': isolated signal and background data.
-              Created by self.separate, after signal and background
-              regions have been identified by self.autorange.
-            * 'bkgsub': background subtracted data, created by 
-              self.bkg_correct
-            * 'ratios': element ratio data, created by self.ratio.
-            * 'calibrated': ratio data calibrated to standards, created by self.calibrate.
-
-        Returns
-        -------
-        pandas.DataFrame object containing background data.
-        """
-        allbkgs = {'uTime': [],
-                   'ns': []}
-
-        if focus_stage == 'despiked':
-            if 'despiked' not in self.stages_complete:
-                focus_stage = 'rawdata'
-
-        for a in self.analytes:
-            allbkgs[a] = []
-
-        n0 = 0
-        for s in self.data.values():
-            if sum(s.bkg) > 0:
-                allbkgs['uTime'].append(s.uTime[s.bkg])
-                allbkgs['ns'].append(enumerate_bool(s.bkg, n0)[s.bkg])
-                n0 = allbkgs['ns'][-1][-1]
-                for a in self.analytes:
-                    allbkgs[a].append(s.data[focus_stage][a][s.bkg])
-
-        allbkgs.update((k, np.concatenate(v)) for k, v in allbkgs.items())
-        bkgs = pd.DataFrame(allbkgs)  # using pandas here because it's much more efficient than loops.
-
-        self.bkg = Bunch()
-        # extract background data from whole dataset
-        if n_max is None:
-            self.bkg['raw'] = bkgs.groupby('ns').filter(lambda x: len(x) > n_min)
-        else:
-            self.bkg['raw'] = bkgs.groupby('ns').filter(lambda x: (len(x) > n_min) & (len(x) < n_max))
-        # calculate per - background region stats
-        self.bkg['summary'] = self.bkg['raw'].groupby('ns').aggregate([np.mean, np.std, stderr])
-        # sort summary by uTime
-        self.bkg['summary'].sort_values(('uTime', 'mean'), inplace=True)
-        # self.bkg['summary'].index = np.arange(self.bkg['summary'].shape[0])
-        # self.bkg['summary'].index.name = 'ns'
-
-        if bkg_filter:
-            # calculate rolling mean and std from summary
-            t = self.bkg['summary'].loc[:, idx[:, 'mean']]
-            r = t.rolling(f_win).aggregate([np.nanmean, np.nanstd])
-            # calculate upper threshold
-            upper = r.loc[:, idx[:, :, 'nanmean']] + f_n_lim * r.loc[:, idx[:, :, 'nanstd']].values
-            # calculate which are over upper threshold
-            over = r.loc[:, idx[:, :, 'nanmean']] > np.roll(upper.values, 1, 0)
-            # identify them
-            ns_drop = over.loc[over.apply(any, 1), :].index.values
-            # drop them from summary
-            self.bkg['summary'].drop(ns_drop, inplace=True)
-            # remove them from raw
-            ind = np.ones(self.bkg['raw'].shape[0], dtype=bool)
-            for ns in ns_drop:
-                ind = ind & (self.bkg['raw'].loc[:, 'ns'] != ns)
-            self.bkg['raw'] = self.bkg['raw'].loc[ind, :]
-        return
 
     @_log
     def bkg_calc_weightedmean(self, analytes=None, weight_fwhm=None,
@@ -570,10 +477,10 @@ class analyse(object):
             * 'ratios': element ratio data, created by self.ratio.
             * 'calibrated': ratio data calibrated to standards, created by self.calibrate.
         """
-        self.background_calculated = BackgroundCalculator(self.autoranged, analytes=analytes, weight_fwhm=weight_fwhm,
+        background_calculated = BackgroundCalculator(self, analytes=analytes, weight_fwhm=weight_fwhm,
                               n_min=n_min, n_max=n_max, cstep=cstep, errtype=errtype,
                               bkg_filter=bkg_filter, f_win=f_win, f_n_lim=f_n_lim, focus_stage=focus_stage)
-        return
+        self.move_attributes_from_previous_stage(background_calculated)
 
     @_log
     def bkg_subtract(self, analytes=None, errtype='stderr', focus_stage='despiked'):
@@ -602,9 +509,8 @@ class analyse(object):
             * 'ratios': element ratio data, created by self.ratio.
             * 'calibrated': ratio data calibrated to standards, created by self.calibrate.
         """
-        self.background_subtracted = BackgroundSubtractor(
-            self.background_calculated, analytes=analytes, errtype=errtype, focus_stage=focus_stage)
-        return
+        background_subtracted = BackgroundSubtractor(self, analytes=analytes, errtype=errtype, focus_stage=focus_stage)
+        self.move_attributes_from_previous_stage(background_subtracted)
 
 
     @_log
@@ -690,7 +596,7 @@ class analyse(object):
         #                      "   bkg_calc_interp1d\n" +
         #                      "   bkg_calc_weightedmean\n")
         if not hasattr(self, 'bkg'):
-            self.get_background()
+            self.bkg_calc_weightedmean()
 
         if analytes is None:
             analytes = self.analytes
@@ -792,8 +698,8 @@ class analyse(object):
         -------
         None
         """
-        self.ratio_calculated = RatioCalculator(
-            self.background_subtracted, internal_standard=internal_standard, analytes=analytes)
+        ratio_calculated = RatioCalculator(self, internal_standard=internal_standard, analytes=analytes)
+        self.move_attributes_from_previous_stage(ratio_calculated)
 
 
     def clear_calibration(self):
@@ -841,10 +747,10 @@ class analyse(object):
         -------
         None
         """
-        self.calibrated = Calibrator(self.ratio_calculated, analytes=analytes, drift_correct=drift_correct,
+        calibrated = Calibrator(self, analytes=analytes, drift_correct=drift_correct,
                                      srms_used=srms_used, zero_intercept=zero_intercept,
                                      n_min=n_min, reload_srm_database=reload_srm_database)
-        return
+        self.move_attributes_from_previous_stage(calibrated)
 
 
     # data filtering
